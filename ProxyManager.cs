@@ -21,7 +21,12 @@ public sealed class ProxyManager
     public async Task LoadAndStartAsync()
     {
         if (!File.Exists(_configPath))
+        {
+            // First boot (no saved config yet): seed from PROXY_* env vars.
+            // Once a config file exists, it wins — UI edits survive restarts.
+            await SeedFromEnvironmentAsync();
             return;
+        }
         List<ProxyConfig>? configs = null;
         try
         {
@@ -38,6 +43,45 @@ public sealed class ProxyManager
             _proxies[cfg.Id] = instance;
             if (cfg.Enabled)
                 instance.Start();
+        }
+    }
+
+    /// <summary>
+    /// Creates proxies from env vars of the form
+    /// PROXY_&lt;NAME&gt;=&lt;listenPort&gt;:&lt;targetHost&gt;:&lt;targetPort&gt;[:&lt;latencyMs&gt;[:&lt;jitterMs&gt;]]
+    /// e.g. PROXY_POSTGRES=15432:db:5432:100
+    /// </summary>
+    private async Task SeedFromEnvironmentAsync()
+    {
+        foreach (System.Collections.DictionaryEntry entry in Environment.GetEnvironmentVariables())
+        {
+            if (entry.Key is not string key
+                || !key.StartsWith("PROXY_", StringComparison.Ordinal)
+                || entry.Value is not string value)
+                continue;
+
+            var name = key["PROXY_".Length..].ToLowerInvariant().Replace('_', '-');
+            var parts = value.Split(':');
+            int listenPort = 0, targetPort = 0, latency = 0, jitter = 0;
+            bool parsed = parts.Length is >= 3 and <= 5
+                && int.TryParse(parts[0], out listenPort)
+                && int.TryParse(parts[2], out targetPort)
+                && (parts.Length < 4 || int.TryParse(parts[3], out latency))
+                && (parts.Length < 5 || int.TryParse(parts[4], out jitter));
+            if (!parsed)
+            {
+                _log.LogWarning(
+                    "Ignoring {Key}: expected <listenPort>:<targetHost>:<targetPort>[:<latencyMs>[:<jitterMs>]], got \"{Value}\"",
+                    key, value);
+                continue;
+            }
+
+            var (_, error) = await CreateAsync(new ProxyUpsert(
+                name, listenPort, parts[1], targetPort, latency, jitter, Enabled: true));
+            if (error is not null)
+                _log.LogWarning("Ignoring {Key}: {Error}", key, error);
+            else
+                _log.LogInformation("Seeded proxy \"{Name}\" from {Key}", name, key);
         }
     }
 

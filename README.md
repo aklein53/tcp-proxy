@@ -71,6 +71,32 @@ DELETE /api/proxies/{id}     remove
 |---------------|---------------------|----------------------------------|
 | `CONFIG_PATH` | `/data/config.json` | Where proxy configs are persisted |
 | `ASPNETCORE_URLS` | `http://+:8080` | Web UI / API bind address        |
+| `PROXY_<NAME>` | —                  | Seed a proxy on first boot (see below) |
+
+### Initial proxies from environment
+
+`PROXY_<NAME>` variables define proxies to create on first boot, in the form
+`<listenPort>:<targetHost>:<targetPort>[:<latencyMs>[:<jitterMs>]]`:
+
+```yaml
+services:
+  tcp-proxy:
+    image: ghcr.io/aklein53/tcp-proxy:latest
+    environment:
+      - PROXY_POSTGRES=15432:db:5432:100     # 100ms latency to service "db"
+      - PROXY_REDIS=16379:redis:6379:40:10   # 40ms ± 10ms jitter
+    ports:
+      - "8080:8080"
+      - "15432:15432"
+      - "16379:16379"
+    volumes:
+      - tcp-proxy-data:/data
+```
+
+Seeding is **first-boot only**: it runs when `CONFIG_PATH` doesn't exist yet.
+After that, the saved config wins, so changes made in the UI survive restarts
+and env vars won't overwrite or resurrect anything. To re-seed from the
+environment, remove the config file (e.g. `docker compose down -v`).
 
 ## Local development
 
