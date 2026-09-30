@@ -15,6 +15,15 @@ public sealed record ProxyConfig
     /// <summary>Random 0..JitterMs added on top of LatencyMs per chunk. Ordering is preserved.</summary>
     public int JitterMs { get; init; }
 
+    /// <summary>
+    /// Percentage (0-100) of chunks treated as a dropped segment: the chunk waits out a
+    /// retransmit timeout instead of being discarded, so the byte stream stays intact.
+    /// </summary>
+    public double LossPercent { get; init; }
+
+    /// <summary>Close connections with no traffic in either direction for this long. 0 disables.</summary>
+    public int IdleTimeoutSeconds { get; init; }
+
     public bool Enabled { get; init; } = true;
 }
 
@@ -26,6 +35,8 @@ public sealed record ProxyUpsert(
     int TargetPort,
     int LatencyMs,
     int JitterMs,
+    double LossPercent,
+    int IdleTimeoutSeconds,
     bool Enabled);
 
 /// <summary>API response: config plus live state.</summary>
@@ -37,10 +48,14 @@ public sealed record ProxyView(
     int TargetPort,
     int LatencyMs,
     int JitterMs,
+    double LossPercent,
+    int IdleTimeoutSeconds,
     bool Enabled,
     bool Running,
     string? Error,
     int ActiveConnections,
     long TotalConnections,
     long BytesUp,
-    long BytesDown);
+    long BytesDown,
+    long IdleClosed,
+    long Retransmits);

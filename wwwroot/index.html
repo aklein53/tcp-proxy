@@ -78,6 +78,8 @@
       <label>Target port <input name="targetPort" class="num" type="number" min="1" max="65535" required></label>
       <label>Latency (ms) <input name="latencyMs" class="num" type="number" min="0" value="0"></label>
       <label>Jitter (ms) <input name="jitterMs" class="num" type="number" min="0" value="0"></label>
+      <label title="Percentage of chunks delayed by a simulated retransmit. Data is never discarded.">Loss (%) <input name="lossPercent" class="num" type="number" min="0" max="100" step="0.1" value="0"></label>
+      <label title="Close connections with no traffic for this long. 0 disables.">Idle close (s) <input name="idleTimeoutSeconds" class="num" type="number" min="0" value="0"></label>
       <button class="primary" type="submit">Add proxy</button>
     </form>
   </div>
@@ -86,7 +88,7 @@
     <table>
       <thead>
         <tr>
-          <th>Name</th><th>Route</th><th>Latency</th><th>Jitter</th>
+          <th>Name</th><th>Route</th><th>Latency</th><th>Jitter</th><th>Loss %</th><th>Idle close</th>
           <th>Status</th><th>Traffic</th><th></th>
         </tr>
       </thead>
@@ -146,6 +148,8 @@ function render() {
         <td class="route"></td>
         <td><input class="num" type="number" min="0" data-field="latencyMs"></td>
         <td><input class="num" type="number" min="0" data-field="jitterMs"></td>
+        <td><input class="num" type="number" min="0" max="100" step="0.1" data-field="lossPercent"></td>
+        <td><input class="num" type="number" min="0" data-field="idleTimeoutSeconds" title="0 disables"></td>
         <td class="status"><span class="dot"></span><span class="label"></span><span class="why"></span></td>
         <td class="stats"></td>
         <td>
@@ -175,8 +179,12 @@ function render() {
     tr.querySelector('.status .label').textContent =
       state === 'running' ? `running · ${p.activeConnections} conn` : state;
     tr.querySelector('.status .why').textContent = p.error || '';
+    const extra = [];
+    if (p.retransmits) extra.push(`${p.retransmits} retx`);
+    if (p.idleClosed) extra.push(`${p.idleClosed} idle-closed`);
     tr.querySelector('.stats').textContent =
-      `${p.totalConnections} conns · ↑ ${bytes(p.bytesUp)} · ↓ ${bytes(p.bytesDown)}`;
+      `${p.totalConnections} conns · ↑ ${bytes(p.bytesUp)} · ↓ ${bytes(p.bytesDown)}`
+      + (extra.length ? ' · ' + extra.join(' · ') : '');
     tr.querySelector('[data-act=toggle]').textContent = p.enabled ? 'Disable' : 'Enable';
   }
 }
@@ -211,6 +219,8 @@ document.getElementById('addForm').addEventListener('submit', async e => {
       targetPort: +f.get('targetPort'),
       latencyMs: +f.get('latencyMs') || 0,
       jitterMs: +f.get('jitterMs') || 0,
+      lossPercent: +f.get('lossPercent') || 0,
+      idleTimeoutSeconds: +f.get('idleTimeoutSeconds') || 0,
       enabled: true,
     });
     e.target.reset();

@@ -15,6 +15,9 @@ public sealed class ProxyInstance
 {
     private const int BufferSize = 64 * 1024;
 
+    /// <summary>Caps the retransmit backoff so a near-100% loss rate can't stall a chunk forever.</summary>
+    private const int MaxRetransmits = 8;
+
     private volatile ProxyConfig _config;
     private readonly ILogger _log;
 
@@ -26,6 +29,15 @@ public sealed class ProxyInstance
     private long _totalConnections;
     private long _bytesUp;   // client -> target
     private long _bytesDown; // target -> client
+    private long _idleClosed;
+    private long _retransmits;
+
+    /// <summary>Last-activity clock shared by both directions of one connection.</summary>
+    private sealed class ConnectionState
+    {
+        public long LastActivityTicks = Stopwatch.GetTimestamp();
+        public void Touch() => Volatile.Write(ref LastActivityTicks, Stopwatch.GetTimestamp());
+    }
 
     public ProxyInstance(ProxyConfig config, ILogger log)
     {
@@ -41,12 +53,14 @@ public sealed class ProxyInstance
 
     public ProxyView View() => new(
         _config.Id, _config.Name, _config.ListenPort, _config.TargetHost, _config.TargetPort,
-        _config.LatencyMs, _config.JitterMs, _config.Enabled,
-        Running, LastError,
+        _config.LatencyMs, _config.JitterMs, _config.LossPercent, _config.IdleTimeoutSeconds,
+        _config.Enabled, Running, LastError,
         Volatile.Read(ref _activeConnections),
         Interlocked.Read(ref _totalConnections),
         Interlocked.Read(ref _bytesUp),
-        Interlocked.Read(ref _bytesDown));
+        Interlocked.Read(ref _bytesDown),
+        Interlocked.Read(ref _idleClosed),
+        Interlocked.Read(ref _retransmits));
 
     /// <summary>Starts listening. Returns false (with LastError set) if the port can't be bound.</summary>
     public bool Start()
@@ -124,11 +138,21 @@ public sealed class ProxyInstance
             await target.ConnectAsync(cfg.TargetHost, cfg.TargetPort, linked.Token);
             target.NoDelay = true;
 
-            // Each pump swallows its own errors but cancels the other direction on failure,
-            // so a reset on either side tears the pair down. A clean EOF only half-closes.
-            await Task.WhenAll(
-                RunPumpAsync(client.Client, target.Client, n => Interlocked.Add(ref _bytesUp, n), linked),
-                RunPumpAsync(target.Client, client.Client, n => Interlocked.Add(ref _bytesDown, n), linked));
+            var state = new ConnectionState();
+            var watchdog = IdleWatchdogAsync(state, linked);
+            try
+            {
+                // Each pump swallows its own errors but cancels the other direction on failure,
+                // so a reset on either side tears the pair down. A clean EOF only half-closes.
+                await Task.WhenAll(
+                    RunPumpAsync(client.Client, target.Client, state, n => Interlocked.Add(ref _bytesUp, n), linked),
+                    RunPumpAsync(target.Client, client.Client, state, n => Interlocked.Add(ref _bytesDown, n), linked));
+            }
+            finally
+            {
+                linked.Cancel(); // retire the watchdog
+                await watchdog;
+            }
         }
         catch (OperationCanceledException) { }
         catch (Exception ex)
@@ -141,11 +165,12 @@ public sealed class ProxyInstance
         }
     }
 
-    private async Task RunPumpAsync(Socket source, Socket dest, Action<int> onBytes, CancellationTokenSource linked)
+    private async Task RunPumpAsync(
+        Socket source, Socket dest, ConnectionState state, Action<int> onBytes, CancellationTokenSource linked)
     {
         try
         {
-            await PumpAsync(source, dest, onBytes, linked.Token);
+            await PumpAsync(source, dest, state, onBytes, linked.Token);
         }
         catch
         {
@@ -154,11 +179,69 @@ public sealed class ProxyInstance
     }
 
     /// <summary>
+    /// Cancels the connection once it has been idle in both directions for IdleTimeoutSeconds.
+    /// The timeout is re-read each tick, so changing it in the UI applies to live connections.
+    /// </summary>
+    private async Task IdleWatchdogAsync(ConnectionState state, CancellationTokenSource linked)
+    {
+        var ct = linked.Token;
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                int timeoutSec = _config.IdleTimeoutSeconds;
+                if (timeoutSec <= 0)
+                {
+                    await Task.Delay(1000, ct); // disabled for now; it may be enabled later
+                    continue;
+                }
+                long idleMs = (Stopwatch.GetTimestamp() - Volatile.Read(ref state.LastActivityTicks))
+                              * 1000 / Stopwatch.Frequency;
+                long remainingMs = timeoutSec * 1000L - idleMs;
+                if (remainingMs <= 0)
+                {
+                    Interlocked.Increment(ref _idleClosed);
+                    _log.LogDebug("Proxy {Name}: closing connection idle for {Timeout}s", _config.Name, timeoutSec);
+                    await linked.CancelAsync();
+                    return;
+                }
+                await Task.Delay((int)Math.Min(remainingMs, 1000), ct);
+            }
+        }
+        catch (OperationCanceledException) { }
+    }
+
+    /// <summary>
+    /// Extra delay modelling packet loss. A dropped segment is not lost data — TCP retransmits
+    /// it after a timeout, doubling that timeout for each successive drop — so a "dropped" chunk
+    /// is held back rather than discarded, keeping the byte stream intact. Since chunks leave in
+    /// order, holding one back also stalls those behind it, reproducing head-of-line blocking.
+    /// </summary>
+    private long LossDelayMs(ProxyConfig cfg)
+    {
+        if (cfg.LossPercent <= 0)
+            return 0;
+        double probability = cfg.LossPercent / 100.0;
+        // Linux clamps the retransmission timeout to 200ms (TCP_RTO_MIN); above that it
+        // tracks the round trip, which here is twice the configured one-way latency.
+        double rtoMs = Math.Max(200, 2.0 * cfg.LatencyMs);
+        long delayMs = 0;
+        for (int attempt = 0; attempt < MaxRetransmits && Random.Shared.NextDouble() < probability; attempt++)
+        {
+            delayMs += (long)rtoMs;
+            rtoMs *= 2;
+            Interlocked.Increment(ref _retransmits);
+        }
+        return delayMs;
+    }
+
+    /// <summary>
     /// Copies source -> dest, releasing each chunk only after the configured delay.
     /// Reads keep running while chunks wait, so latency is added without capping
     /// throughput (a bounded read + sleep loop would conflate the two).
     /// </summary>
-    private async Task PumpAsync(Socket source, Socket dest, Action<int> onBytes, CancellationToken ct)
+    private async Task PumpAsync(
+        Socket source, Socket dest, ConnectionState state, Action<int> onBytes, CancellationToken ct)
     {
         var channel = Channel.CreateUnbounded<(byte[] Buf, int Len, long Due)>(
             new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
@@ -176,10 +259,12 @@ public sealed class ProxyInstance
                         ArrayPool<byte>.Shared.Return(buf);
                         break;
                     }
+                    state.Touch();
                     var cfg = _config;
                     long delayMs = cfg.LatencyMs;
                     if (cfg.JitterMs > 0)
                         delayMs += Random.Shared.Next(cfg.JitterMs + 1);
+                    delayMs += LossDelayMs(cfg);
                     long due = Stopwatch.GetTimestamp() + delayMs * Stopwatch.Frequency / 1000;
                     await channel.Writer.WriteAsync((buf, n, due), ct);
                 }

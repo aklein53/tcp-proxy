@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json;
 
 namespace TcpProxy;
@@ -48,8 +49,8 @@ public sealed class ProxyManager
 
     /// <summary>
     /// Creates proxies from env vars of the form
-    /// PROXY_&lt;NAME&gt;=&lt;listenPort&gt;:&lt;targetHost&gt;:&lt;targetPort&gt;[:&lt;latencyMs&gt;[:&lt;jitterMs&gt;]]
-    /// e.g. PROXY_POSTGRES=15432:db:5432:100
+    /// PROXY_&lt;NAME&gt;=&lt;listenPort&gt;:&lt;targetHost&gt;:&lt;targetPort&gt;[:tuning...]
+    /// e.g. PROXY_POSTGRES=15432:db:5432:100 or PROXY_REDIS=16379:redis:6379:idle=60
     /// </summary>
     private async Task SeedFromEnvironmentAsync()
     {
@@ -61,28 +62,89 @@ public sealed class ProxyManager
                 continue;
 
             var name = key["PROXY_".Length..].ToLowerInvariant().Replace('_', '-');
-            var parts = value.Split(':');
-            int listenPort = 0, targetPort = 0, latency = 0, jitter = 0;
-            bool parsed = parts.Length is >= 3 and <= 5
-                && int.TryParse(parts[0], out listenPort)
-                && int.TryParse(parts[2], out targetPort)
-                && (parts.Length < 4 || int.TryParse(parts[3], out latency))
-                && (parts.Length < 5 || int.TryParse(parts[4], out jitter));
-            if (!parsed)
+            if (!TryParseSeed(name, value, out var upsert, out var parseError))
             {
-                _log.LogWarning(
-                    "Ignoring {Key}: expected <listenPort>:<targetHost>:<targetPort>[:<latencyMs>[:<jitterMs>]], got \"{Value}\"",
-                    key, value);
+                _log.LogWarning("Ignoring {Key}=\"{Value}\": {Error}", key, value, parseError);
                 continue;
             }
 
-            var (_, error) = await CreateAsync(new ProxyUpsert(
-                name, listenPort, parts[1], targetPort, latency, jitter, Enabled: true));
+            var (_, error) = await CreateAsync(upsert);
             if (error is not null)
                 _log.LogWarning("Ignoring {Key}: {Error}", key, error);
             else
                 _log.LogInformation("Seeded proxy \"{Name}\" from {Key}", name, key);
         }
+    }
+
+    /// <summary>The optional tuning fields, in the order they may be given positionally.</summary>
+    private static readonly string[] SeedFields = ["latency", "jitter", "loss", "idle"];
+
+    /// <summary>
+    /// Parses a PROXY_* value: listenPort:targetHost:targetPort, then any of the tuning fields
+    /// either positionally (latency:jitter:loss:idle) or by name (loss=5:idle=60), so a later
+    /// field can be set without padding the earlier ones with zeroes.
+    /// </summary>
+    private static bool TryParseSeed(string name, string value, out ProxyUpsert upsert, out string error)
+    {
+        upsert = null!;
+        var parts = value.Split(':');
+        if (parts.Length < 3)
+        {
+            error = "expected <listenPort>:<targetHost>:<targetPort>[:latency[:jitter[:loss[:idle]]]]";
+            return false;
+        }
+        if (!int.TryParse(parts[0], out int listenPort) || !int.TryParse(parts[2], out int targetPort))
+        {
+            error = "listen port and target port must be numbers";
+            return false;
+        }
+
+        var fields = new Dictionary<string, double>();
+        int nextPositional = 0;
+        foreach (var part in parts.Skip(3))
+        {
+            string field, raw;
+            int eq = part.IndexOf('=');
+            if (eq >= 0)
+            {
+                field = part[..eq].Trim().ToLowerInvariant();
+                raw = part[(eq + 1)..];
+            }
+            else if (nextPositional < SeedFields.Length)
+            {
+                field = SeedFields[nextPositional];
+                raw = part;
+            }
+            else
+            {
+                error = $"too many fields (expected at most {SeedFields.Length} after the target)";
+                return false;
+            }
+
+            int index = Array.IndexOf(SeedFields, field);
+            if (index < 0)
+            {
+                error = $"unknown field \"{field}\" (expected one of {string.Join(", ", SeedFields)})";
+                return false;
+            }
+            if (!double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out double parsed))
+            {
+                error = $"\"{raw}\" is not a number";
+                return false;
+            }
+            fields[field] = parsed;
+            nextPositional = index + 1;
+        }
+
+        upsert = new ProxyUpsert(
+            name, listenPort, parts[1], targetPort,
+            (int)fields.GetValueOrDefault("latency"),
+            (int)fields.GetValueOrDefault("jitter"),
+            fields.GetValueOrDefault("loss"),
+            (int)fields.GetValueOrDefault("idle"),
+            Enabled: true);
+        error = "";
+        return true;
     }
 
     public async Task<List<ProxyView>> ListAsync()
@@ -114,6 +176,8 @@ public sealed class ProxyManager
                 TargetPort = dto.TargetPort,
                 LatencyMs = dto.LatencyMs,
                 JitterMs = dto.JitterMs,
+                LossPercent = dto.LossPercent,
+                IdleTimeoutSeconds = dto.IdleTimeoutSeconds,
                 Enabled = dto.Enabled,
             };
             var instance = new ProxyInstance(cfg, _log);
@@ -147,6 +211,8 @@ public sealed class ProxyManager
                 TargetPort = dto.TargetPort,
                 LatencyMs = dto.LatencyMs,
                 JitterMs = dto.JitterMs,
+                LossPercent = dto.LossPercent,
+                IdleTimeoutSeconds = dto.IdleTimeoutSeconds,
                 Enabled = dto.Enabled,
             };
             instance.UpdateConfig(cfg);
@@ -192,6 +258,11 @@ public sealed class ProxyManager
             return "Latency must be 0-600000 ms.";
         if (dto.JitterMs is < 0 or > 60_000)
             return "Jitter must be 0-60000 ms.";
+        // NaN fails every comparison, so reject it explicitly rather than letting it through.
+        if (double.IsNaN(dto.LossPercent) || dto.LossPercent is < 0 or > 100)
+            return "Loss must be 0-100 %.";
+        if (dto.IdleTimeoutSeconds is < 0 or > 86_400)
+            return "Idle timeout must be 0-86400 s (0 disables).";
         if (_proxies.Values.Any(p => p.Config.Id != exceptId && p.Config.ListenPort == dto.ListenPort))
             return $"Another proxy already uses listen port {dto.ListenPort}.";
         return null;
