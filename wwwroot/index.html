@@ -30,10 +30,11 @@
   }
   form.add { display: flex; flex-wrap: wrap; gap: .75rem; align-items: flex-end; }
   form.add label { display: flex; flex-direction: column; gap: .25rem; font-size: .78rem; color: var(--muted); }
-  input {
+  input, select {
     background: var(--bg); color: var(--text); border: 1px solid var(--border);
     border-radius: 6px; padding: .45rem .6rem; font: inherit; width: 8.5rem;
   }
+  select { width: auto; }
   input.num { width: 6rem; }
   input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
   button {
@@ -80,6 +81,14 @@
       <label>Jitter (ms) <input name="jitterMs" class="num" type="number" min="0" value="0"></label>
       <label title="Percentage of chunks delayed by a simulated retransmit. Data is never discarded.">Loss (%) <input name="lossPercent" class="num" type="number" min="0" max="100" step="0.1" value="0"></label>
       <label title="Close connections with no traffic for this long. 0 disables.">Idle close (s) <input name="idleTimeoutSeconds" class="num" type="number" min="0" value="0"></label>
+      <label title="FIN: peer reads end-of-file. RST: peer's read fails with a reset.">On idle
+        <select name="idleAction">
+          <option value="Close">FIN (close)</option>
+          <option value="Reset">RST now</option>
+          <option value="ResetOnUse">RST on next use</option>
+          <option value="Blackhole">Black hole</option>
+        </select>
+      </label>
       <button class="primary" type="submit">Add proxy</button>
     </form>
   </div>
@@ -88,7 +97,8 @@
     <table>
       <thead>
         <tr>
-          <th>Name</th><th>Route</th><th>Latency</th><th>Jitter</th><th>Loss %</th><th>Idle close</th>
+          <th>Name</th><th>Route</th><th>Latency (ms)</th><th>Jitter (ms)</th><th>Loss (%)</th>
+          <th>Idle close (s)</th><th>On idle</th>
           <th>Status</th><th>Traffic</th><th></th>
         </tr>
       </thead>
@@ -150,14 +160,22 @@ function render() {
         <td><input class="num" type="number" min="0" data-field="jitterMs"></td>
         <td><input class="num" type="number" min="0" max="100" step="0.1" data-field="lossPercent"></td>
         <td><input class="num" type="number" min="0" data-field="idleTimeoutSeconds" title="0 disables"></td>
+        <td><select data-field="idleAction" title="FIN: peer reads end-of-file. RST now: peer's next write fails. RST on next use: write succeeds, read is reset. Black hole: peer hangs.">
+          <option value="Close">FIN</option>
+          <option value="Reset">RST now</option>
+          <option value="ResetOnUse">RST on use</option>
+          <option value="Blackhole">Black hole</option>
+        </select></td>
         <td class="status"><span class="dot"></span><span class="label"></span><span class="why"></span></td>
         <td class="stats"></td>
         <td>
           <button data-act="toggle"></button>
           <button data-act="delete" class="danger">Delete</button>
         </td>`;
-      tr.querySelectorAll('input[data-field]').forEach(inp => {
-        inp.addEventListener('change', () => update(p.id, { [inp.dataset.field]: +inp.value || 0 }));
+      tr.querySelectorAll('[data-field]').forEach(el => {
+        el.addEventListener('change', () => update(p.id, {
+          [el.dataset.field]: el.tagName === 'SELECT' ? el.value : (+el.value || 0),
+        }));
       });
       tr.querySelector('[data-act=toggle]').addEventListener('click', () => {
         const cur = proxies.find(x => x.id === p.id);
@@ -171,8 +189,8 @@ function render() {
     }
     tr.querySelector('.name').textContent = p.name;
     tr.querySelector('.route').textContent = `:${p.listenPort} → ${p.targetHost}:${p.targetPort}`;
-    for (const inp of tr.querySelectorAll('input[data-field]')) {
-      if (inp !== focused) inp.value = p[inp.dataset.field];
+    for (const el of tr.querySelectorAll('[data-field]')) {
+      if (el !== focused) el.value = p[el.dataset.field];
     }
     const state = p.error ? 'error' : (p.running ? 'running' : 'stopped');
     tr.querySelector('.status').className = 'status ' + state;
@@ -221,6 +239,7 @@ document.getElementById('addForm').addEventListener('submit', async e => {
       jitterMs: +f.get('jitterMs') || 0,
       lossPercent: +f.get('lossPercent') || 0,
       idleTimeoutSeconds: +f.get('idleTimeoutSeconds') || 0,
+      idleAction: f.get('idleAction'),
       enabled: true,
     });
     e.target.reset();

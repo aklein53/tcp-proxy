@@ -57,15 +57,38 @@ restarts.
   leave in order, the ones behind it stall too — real head-of-line blocking.
   The byte stream always arrives complete and in order; what degrades is
   latency and throughput, which is what loss actually does to an application.
-- **Idle disconnects** — `idleTimeoutSeconds` closes connections with no
-  traffic in *either* direction for that long (0 disables), for exercising
-  reconnect logic and connection-pool eviction.
+- **Idle disconnects** — `idleTimeoutSeconds` drops connections with no traffic
+  in *either* direction for that long (0 disables), for exercising reconnect
+  logic and connection-pool eviction. `idleAction` picks *how*, because the
+  choice is what the application actually sees — see below.
 - **Live updates** — latency, jitter, loss, and the idle timeout apply
   immediately, even to connections that are already open (target changes
   affect new connections). Changing the listen port or toggling enabled
   restarts the listener.
 - **Stats** — active/total connections, bytes each way, simulated retransmits,
   and idle closures, live in the UI.
+
+## Reproducing how a firewall kills connections
+
+Network devices evict idle flows in several different ways, and an application
+sees a *different error* for each. `idleAction` selects which one to imitate.
+The table below is measured against a real client doing what a connection pool
+does — sit idle, then write a request and read the reply:
+
+| `idleAction` | What the proxy does | What the client sees | Oracle reports |
+|---|---|---|---|
+| `Close` (default) | FIN immediately | write succeeds, read returns end-of-file | ORA-03113 end-of-file on communication channel |
+| `Reset` | RST immediately | **write** fails (`EPIPE`) | ORA-12571 TNS:packet writer failure |
+| `ResetOnUse` | drops the flow silently, RSTs when traffic next arrives | write succeeds, **read** fails (`ECONNRESET`) | ORA-12570 TNS:packet reader failure |
+| `Blackhole` | drops the flow silently and never answers | write succeeds, read **hangs** until the client times out | a client-side timeout |
+
+`ResetOnUse` is the behaviour of a typical stateful firewall: it forgets the
+connection while it is idle, then rejects the next packet because it has no
+state for that flow. Both endpoints believe the connection is alive right up
+until it is used.
+
+Pick the row matching the error you see in production, and the proxy will
+reproduce it on demand instead of after an hour of idling.
 
 ## HTTP API
 
@@ -90,6 +113,7 @@ Create/update body:
   "jitterMs": 10,              // random 0..N added per chunk
   "lossPercent": 5,            // 0-100, chance of a retransmit stall
   "idleTimeoutSeconds": 60,    // 0 disables
+  "idleAction": "ResetOnUse",  // Close | Reset | ResetOnUse | Blackhole
   "enabled": true
 }
 ```
@@ -112,7 +136,8 @@ PROXY_<NAME>=<listenPort>:<targetHost>:<targetPort>[:tuning...]
 
 The tuning fields are `latency`, `jitter`, `loss`, and `idle`. Give them
 positionally in that order, or by name in any order — so setting just the idle
-timeout doesn't mean padding the others with zeroes:
+timeout doesn't mean padding the others with zeroes. `onidle` (one of `close`,
+`reset`, `resetonuse`, `blackhole`) is name-only:
 
 ```yaml
 services:
@@ -122,6 +147,7 @@ services:
       - PROXY_POSTGRES=15432:db:5432:100          # 100ms latency to service "db"
       - PROXY_REDIS=16379:redis:6379:40:10        # 40ms ± 10ms jitter
       - PROXY_API=18080:api:8080:loss=5:idle=30   # 5% loss, close after 30s idle
+      - PROXY_ORA=11521:oracle:1521:idle=45:onidle=resetonuse
     ports:
       - "8080:8080"
       - "15432:15432"
@@ -153,5 +179,8 @@ dotnet run          # UI on the port shown in the console (or set ASPNETCORE_URL
   a stalled chunk holds its buffer, and the ones behind it queue up.
 - Retransmit backoff is capped at 8 doublings, so a near-100% loss rate can't
   stall a chunk indefinitely.
+- `Blackhole` holds both sockets open indefinitely by design. Those connections
+  are released when the peer gives up and closes, or when the proxy is
+  disabled or the container restarts.
 - The web UI has no authentication — don't expose port 8080 beyond your
   trusted network.

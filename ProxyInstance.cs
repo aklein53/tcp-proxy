@@ -36,6 +36,10 @@ public sealed class ProxyInstance
     private sealed class ConnectionState
     {
         public long LastActivityTicks = Stopwatch.GetTimestamp();
+
+        /// <summary>Set once the flow has been dropped: bytes are read but no longer forwarded.</summary>
+        public volatile bool Evicted;
+
         public void Touch() => Volatile.Write(ref LastActivityTicks, Stopwatch.GetTimestamp());
     }
 
@@ -54,7 +58,7 @@ public sealed class ProxyInstance
     public ProxyView View() => new(
         _config.Id, _config.Name, _config.ListenPort, _config.TargetHost, _config.TargetPort,
         _config.LatencyMs, _config.JitterMs, _config.LossPercent, _config.IdleTimeoutSeconds,
-        _config.Enabled, Running, LastError,
+        _config.IdleAction, _config.Enabled, Running, LastError,
         Volatile.Read(ref _activeConnections),
         Interlocked.Read(ref _totalConnections),
         Interlocked.Read(ref _bytesUp),
@@ -139,7 +143,7 @@ public sealed class ProxyInstance
             target.NoDelay = true;
 
             var state = new ConnectionState();
-            var watchdog = IdleWatchdogAsync(state, linked);
+            var watchdog = IdleWatchdogAsync(state, linked, client.Client, target.Client);
             try
             {
                 // Each pump swallows its own errors but cancels the other direction on failure,
@@ -182,7 +186,8 @@ public sealed class ProxyInstance
     /// Cancels the connection once it has been idle in both directions for IdleTimeoutSeconds.
     /// The timeout is re-read each tick, so changing it in the UI applies to live connections.
     /// </summary>
-    private async Task IdleWatchdogAsync(ConnectionState state, CancellationTokenSource linked)
+    private async Task IdleWatchdogAsync(
+        ConnectionState state, CancellationTokenSource linked, params Socket[] sockets)
     {
         var ct = linked.Token;
         try
@@ -200,8 +205,44 @@ public sealed class ProxyInstance
                 long remainingMs = timeoutSec * 1000L - idleMs;
                 if (remainingMs <= 0)
                 {
+                    var action = _config.IdleAction;
                     Interlocked.Increment(ref _idleClosed);
-                    _log.LogDebug("Proxy {Name}: closing connection idle for {Timeout}s", _config.Name, timeoutSec);
+                    _log.LogDebug("Proxy {Name}: connection idle for {Timeout}s -> {Action}",
+                        _config.Name, timeoutSec, action);
+
+                    if (action is IdleAction.ResetOnUse or IdleAction.Blackhole)
+                    {
+                        // Drop the flow the way a stateful firewall does: stop forwarding, but
+                        // leave both sockets open so neither end notices anything yet.
+                        state.Evicted = true;
+                        if (action == IdleAction.Blackhole)
+                            return; // never answer again; the peer hangs until it gives up
+
+                        // Reset only once a peer actually uses the connection, which is when a
+                        // firewall sees a packet for a flow it no longer has state for.
+                        long evictedAt = Volatile.Read(ref state.LastActivityTicks);
+                        while (Volatile.Read(ref state.LastActivityTicks) == evictedAt)
+                            await Task.Delay(25, ct);
+                    }
+
+                    if (action != IdleAction.Close)
+                    {
+                        // SO_LINGER with a zero timeout makes close() emit a RST rather than a FIN.
+                        // Close here rather than leaving it to the pumps' teardown, so the reset is
+                        // what reaches the peer instead of a FIN from the ordinary close path.
+                        foreach (var socket in sockets)
+                        {
+                            try
+                            {
+                                socket.LingerState = new LingerOption(true, 0);
+                                socket.Dispose();
+                            }
+                            catch (Exception ex)
+                            {
+                                _log.LogDebug("Proxy {Name}: reset failed: {Error}", _config.Name, ex.Message);
+                            }
+                        }
+                    }
                     await linked.CancelAsync();
                     return;
                 }
@@ -260,6 +301,13 @@ public sealed class ProxyInstance
                         break;
                     }
                     state.Touch();
+                    if (state.Evicted)
+                    {
+                        // The flow is gone: swallow the bytes rather than forwarding them.
+                        // The watchdog decides whether to reset the peer or stay silent.
+                        ArrayPool<byte>.Shared.Return(buf);
+                        continue;
+                    }
                     var cfg = _config;
                     long delayMs = cfg.LatencyMs;
                     if (cfg.JitterMs > 0)

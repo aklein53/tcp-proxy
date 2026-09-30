@@ -100,6 +100,7 @@ public sealed class ProxyManager
         }
 
         var fields = new Dictionary<string, double>();
+        var idleAction = IdleAction.Close;
         int nextPositional = 0;
         foreach (var part in parts.Skip(3))
         {
@@ -121,10 +122,21 @@ public sealed class ProxyManager
                 return false;
             }
 
+            // Named-only, since it isn't a number and has no positional slot.
+            if (field == "onidle")
+            {
+                if (!Enum.TryParse(raw, ignoreCase: true, out idleAction))
+                {
+                    error = $"onidle must be one of {string.Join(", ", Enum.GetNames<IdleAction>()).ToLowerInvariant()}, got \"{raw}\"";
+                    return false;
+                }
+                continue;
+            }
+
             int index = Array.IndexOf(SeedFields, field);
             if (index < 0)
             {
-                error = $"unknown field \"{field}\" (expected one of {string.Join(", ", SeedFields)})";
+                error = $"unknown field \"{field}\" (expected one of {string.Join(", ", SeedFields)}, onidle)";
                 return false;
             }
             if (!double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out double parsed))
@@ -142,6 +154,7 @@ public sealed class ProxyManager
             (int)fields.GetValueOrDefault("jitter"),
             fields.GetValueOrDefault("loss"),
             (int)fields.GetValueOrDefault("idle"),
+            idleAction,
             Enabled: true);
         error = "";
         return true;
@@ -178,6 +191,7 @@ public sealed class ProxyManager
                 JitterMs = dto.JitterMs,
                 LossPercent = dto.LossPercent,
                 IdleTimeoutSeconds = dto.IdleTimeoutSeconds,
+                IdleAction = dto.IdleAction,
                 Enabled = dto.Enabled,
             };
             var instance = new ProxyInstance(cfg, _log);
@@ -213,6 +227,7 @@ public sealed class ProxyManager
                 JitterMs = dto.JitterMs,
                 LossPercent = dto.LossPercent,
                 IdleTimeoutSeconds = dto.IdleTimeoutSeconds,
+                IdleAction = dto.IdleAction,
                 Enabled = dto.Enabled,
             };
             instance.UpdateConfig(cfg);
